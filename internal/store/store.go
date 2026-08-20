@@ -115,9 +115,31 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // Ping checks the database is answering. For the health check and for startup.
+//
+// It reads from a real table rather than running `SELECT 1`, and the difference is the whole point.
+// `SELECT 1` is a constant expression: SQLite answers it without opening a b-tree or reading a page,
+// so it proves the driver replies and a connection was obtainable — worth something, since with a
+// single connection an obtainable one means the server is not wedged behind an in-flight request —
+// but it says nothing about whether the storage underneath can still be read. On a replicated or
+// network volume, storage is exactly what fails.
+//
+// So this reads the highest sequence, which walks the primary key index and touches at least the
+// b-tree root. Still O(1) and still sub-millisecond, but it goes through the pager.
+//
+// Honest about its limits: a root page already in SQLite's cache is answered from memory, so this is
+// not proof that a disk read would succeed. It is strictly more evidence than a constant, at the same
+// cost, and combined with a bounded context it turns a stalled or lock-starved database into a
+// failed probe rather than a hanging one.
+//
+// An empty database returns no rows, which is health rather than failure.
 func (s *Store) Ping(ctx context.Context) error {
-	var one int
-	return s.db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
+	var sequence sql.NullInt64
+	err := s.db.QueryRowContext(ctx, "SELECT sequence FROM entries ORDER BY sequence DESC LIMIT 1").
+		Scan(&sequence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 // Backup writes a consistent copy of the database to a new file.

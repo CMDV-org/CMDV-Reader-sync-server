@@ -86,6 +86,12 @@ func fixtures() map[string]any {
 
 		"health": HealthResponse{Status: "ok", Version: ProtocolVersion},
 
+		// The operational probe. Its body is pinned because a monitor matches on it as a literal —
+		// blackbox_exporter's body regexp, a Kubernetes probe, a shell script with grep — so changing
+		// it silently turns somebody's alerting green or red for no reason.
+		"healthz":      HealthzResponse{OK: true},
+		"healthz-down": HealthzResponse{OK: false},
+
 		"error-invalid-credentials": ErrorResponse{
 			Reason:  ReasonInvalidCredentials,
 			Message: "That token was refused.",
@@ -153,6 +159,8 @@ func TestFixturesDecodeIntoTheirTypes(t *testing.T) {
 		"sync-response-empty":       func() any { return new(SyncResponse) },
 		"devices":                   func() any { return new([]DeviceInfo) },
 		"health":                    func() any { return new(HealthResponse) },
+		"healthz":                   func() any { return new(HealthzResponse) },
+		"healthz-down":              func() any { return new(HealthzResponse) },
 		"error-invalid-credentials": func() any { return new(ErrorResponse) },
 	}
 

@@ -683,3 +683,201 @@ func TestAnOversizedSingleBlobIsRefused(t *testing.T) {
 		t.Errorf("want 400, got %s", resp.Status)
 	}
 }
+
+// MARK: /healthz
+
+// The minimum a probe needs: 200, a body it can match on a fixed string, and no authentication.
+func TestHealthzAnswersWithoutAuthentication(t *testing.T) {
+	h := newHarness(t)
+
+	resp, err := h.server.Client().Get(h.server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("getting healthz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %s", resp.Status)
+	}
+	// Asserted as an exact string, not decoded, because a monitor matches bytes. blackbox_exporter's
+	// fail_if_body_not_matches_regexp is looking at this literal.
+	body := readBody(t, resp)
+	if body != `{"ok":true}` {
+		t.Errorf("want `{\"ok\":true}`, got %q", body)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("want application/json, got %q", got)
+	}
+}
+
+// `curl -sI` sends HEAD, and a probe configured that way must not get a 404 or a 405. net/http serves
+// HEAD from a GET pattern and suppresses the body itself, so this costs no extra route — but it is
+// worth pinning, because it is invisible until somebody's monitor is silently red.
+func TestHealthzAnswersHead(t *testing.T) {
+	h := newHarness(t)
+
+	resp, err := h.server.Client().Head(h.server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("HEAD healthz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 for HEAD, got %s", resp.Status)
+	}
+	if body := readBody(t, resp); body != "" {
+		t.Errorf("HEAD returned a body: %q", body)
+	}
+	// The headers still describe the response that a GET would have produced.
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("want application/json on HEAD, got %q", got)
+	}
+}
+
+// The reason /healthz is on its own mux rather than exempted by path inside the middleware. A monitor
+// has no stake in the sync protocol, and must not be capable of going red because of a version header.
+func TestHealthzIgnoresTheProtocolVersion(t *testing.T) {
+	h := newHarness(t)
+
+	for _, version := range []string{"1", "99", "not-a-number", ""} {
+		req, _ := http.NewRequest(http.MethodGet, h.server.URL+"/healthz", nil)
+		if version != "" {
+			req.Header.Set(VersionHeader, version)
+		}
+
+		resp, err := h.server.Client().Do(req)
+		if err != nil {
+			t.Fatalf("version %q: %v", version, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("version %q: want 200, got %s", version, resp.Status)
+		}
+		resp.Body.Close()
+	}
+
+	// While the protocol's own endpoint still refuses a version it cannot speak, which is what makes
+	// the two behaviours a deliberate split rather than an inconsistency.
+	req, _ := http.NewRequest(http.MethodGet, h.server.URL+"/api/v1/health", nil)
+	req.Header.Set(VersionHeader, "99")
+	resp, err := h.server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("getting versioned health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("want the protocol endpoint to still refuse version 99, got %s", resp.Status)
+	}
+}
+
+// A token, valid or not, changes nothing. A probe should not need one and must not be refused for
+// carrying a bad one — a monitor pointed at the wrong URL should not look like a healthy server.
+func TestHealthzIsUnaffectedByATokenEitherWay(t *testing.T) {
+	h := newHarness(t)
+
+	for _, token := range []string{"", tokenA, "not-a-real-token-but-long-enough-to-pass="} {
+		resp := h.do(http.MethodGet, "/healthz", token, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("token %q: want 200, got %s", token, resp.Status)
+		}
+	}
+}
+
+// This is the whole reason the endpoint touches the database. A closed store stands in for the failure
+// that actually matters — a wedged or lock-starved database on replicated storage — and the probe has
+// to report it rather than answering 200 because the process is still running.
+func TestHealthzReportsAFailedDatabase(t *testing.T) {
+	h := newHarness(t)
+
+	// Healthy first, so the assertion below is about the database and not about the route.
+	if resp := h.do(http.MethodGet, "/healthz", "", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 before closing the store, got %s", resp.Status)
+	}
+
+	if err := h.store.Close(); err != nil {
+		t.Fatalf("closing the store: %v", err)
+	}
+
+	resp := h.do(http.MethodGet, "/healthz", "", nil)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("want 500 once the database cannot answer, got %s", resp.Status)
+	}
+	if body := readBody(t, resp); body != `{"ok":false}` {
+		t.Errorf("want `{\"ok\":false}`, got %q", body)
+	}
+}
+
+// A probe answering every fifteen seconds must not fill the log. Successful probes go to debug so
+// `info` stays worth reading; a failure is logged normally, because that is the line an operator will
+// come looking for.
+func TestSuccessfulProbesDoNotFillTheLogButFailuresDo(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	server := httptest.NewServer(New(st, auth.New([]string{tokenA}), logger).Handler())
+	t.Cleanup(server.Close)
+
+	for _, path := range []string{"/healthz", "/api/v1/health"} {
+		resp, err := server.Client().Get(server.URL + path)
+		if err != nil {
+			t.Fatalf("getting %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	if strings.Contains(logged.String(), "healthz") {
+		t.Errorf("a successful probe was logged at info:\n%s", logged.String())
+	}
+
+	// A real request is still logged, so this is quietening probes rather than quietening the log.
+	resp, err := server.Client().Get(server.URL + "/api/v1/devices")
+	if err != nil {
+		t.Fatalf("getting devices: %v", err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(logged.String(), "/api/v1/devices") {
+		t.Errorf("an ordinary request was not logged at info:\n%s", logged.String())
+	}
+
+	// And a failing probe is.
+	st.Close()
+	resp, err = server.Client().Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("getting healthz: %v", err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(logged.String(), "healthz") {
+		t.Errorf("a failing probe was not logged at info:\n%s", logged.String())
+	}
+}
+
+// No side effects. A probe running every fifteen seconds must not create a device, write an entry, or
+// move a cursor — otherwise monitoring would slowly accumulate state.
+func TestHealthzHasNoSideEffects(t *testing.T) {
+	h := newHarness(t)
+	h.sync(tokenA, phone, 0, "one")
+
+	before := h.sync(tokenA, tablet, 0)
+	for range 5 {
+		if resp := h.do(http.MethodGet, "/healthz", "", nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe failed: %s", resp.Status)
+		}
+	}
+	after := h.sync(tokenA, tablet, 0)
+
+	if before.Cursor != after.Cursor {
+		t.Errorf("probing moved the cursor: %d then %d", before.Cursor, after.Cursor)
+	}
+
+	resp := h.do(http.MethodGet, "/api/v1/devices", tokenA, nil)
+	var devices []DeviceInfo
+	decode(t, resp, &devices)
+	for _, d := range devices {
+		if d.DeviceID != phone && d.DeviceID != tablet {
+			t.Errorf("probing registered a device: %+v", d)
+		}
+	}
+}

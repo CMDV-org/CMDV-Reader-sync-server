@@ -99,6 +99,34 @@ type HealthResponse struct {
 	Version int    `json:"version"`
 }
 
+// HealthzResponse is what an operational probe sees at /healthz.
+//
+// Deliberately not HealthResponse. This is a different endpoint for a different audience: /healthz is
+// for whatever watches the process — blackbox_exporter, a Kubernetes probe, a Docker HEALTHCHECK —
+// and its body is the smallest thing such a tool can match on. `{"ok":true}` is 11 bytes and a
+// regex-matchable literal.
+//
+// It carries no version, deliberately. A monitor must not have to be updated when the sync protocol
+// moves, and an alert must not fire because it was.
+type HealthzResponse struct {
+	OK bool `json:"ok"`
+}
+
+// HealthzTimeout bounds the database touch behind /healthz.
+//
+// The touch is what makes the probe worth anything: without it, /healthz proves a process is running
+// and accepting connections, which is the least interesting thing that could be true. With it, the
+// probe answers "can this server actually serve", and a wedged or lock-starved database — the failure
+// that matters on replicated storage — shows up as a 500 rather than as a green check and a queue of
+// failing syncs.
+//
+// Bounded because a probe that hangs is worse than one that lies: the monitor's own timeout fires,
+// the check goes red with no reason attached, and on some orchestrators the container is killed. Two
+// seconds is far longer than any query here takes — page reads are capped at 2000 rows and appends at
+// 2000 entries, both milliseconds — and shorter than the store's five-second busy timeout, so a
+// database held by an external lock reports unhealthy rather than waiting on SQLite to give up.
+const HealthzTimeout = 2 * time.Second
+
 // ErrorResponse is a failure the server chose to describe.
 //
 // A machine-readable reason alongside the prose, because a client's response to "your token is not

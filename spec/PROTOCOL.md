@@ -207,8 +207,41 @@ This is list management, not access control. See §2.
 { "status": "ok", "version": 2 }
 ```
 
-This is what a monitor points at, and what lets a client tell "the address is right but the token is
-not" from "cannot connect".
+This is the *client-facing* health endpoint: it reports the protocol version, which is what lets a
+client tell "the address is right but the token is not" from "cannot connect", and lets it discover a
+version mismatch before authenticating.
+
+### `GET /healthz` — operational, and outside this protocol
+
+Not part of the sync protocol, and deliberately not under `/api/v1/`. It is documented here only
+because a server implementation should provide it and a monitor will look for it.
+
+Unauthenticated. It **MUST NOT** require a version header, and **MUST NOT** be refused for carrying
+one — a monitor has no stake in the protocol version, and an alert that fires because the version
+moved is a false alarm. **MUST** answer `HEAD` as well as `GET`, since `curl -sI` and several probes
+use it. **MUST** have no side effects; it is polled continuously.
+
+Exactly two responses, and the bodies are stable literals so a probe can match on them —
+[`healthz.json`](fixtures/healthz.json), [`healthz-down.json`](fixtures/healthz-down.json):
+
+| | Body |
+|---|---|
+| `200` | `{"ok":true}` |
+| `500` | `{"ok":false}` |
+
+It **SHOULD** touch the database — one trivial query, nothing more — and answer `500` when that fails.
+Without it the endpoint proves only that a process is accepting connections, which is the least
+interesting thing that could be true; with it, the probe answers "can this server actually serve", and
+a wedged or lock-starved database shows up as a failure rather than as a green check above a queue of
+failing syncs.
+
+That touch **MUST** be bounded by a short timeout. A probe that hangs is worse than one that lies: the
+monitor's own timeout fires with no reason attached, and some orchestrators will kill the container.
+This implementation uses two seconds, which is far longer than any query it makes and shorter than its
+own database busy timeout, so an externally locked database reports unhealthy rather than waiting.
+
+No version number appears in the body, deliberately: a monitor must not have to be updated when this
+protocol moves.
 
 ## 7. Errors
 
@@ -269,6 +302,6 @@ Not binding on a server, and recorded here because the protocol only makes sense
 ## 10. Reserved
 
 - `sequence` 0 is never assigned; a cursor of 0 means "I have seen nothing".
-- Paths outside `/api/v1/` are unallocated.
+- `/healthz` is allocated for the operational probe in §6. Other paths outside `/api/v1/` are unallocated.
 - A future version will increment `X-CMDV-Sync-Version` and **MAY** change anything in this document.
   A server **MUST** refuse a version it does not implement rather than guess.

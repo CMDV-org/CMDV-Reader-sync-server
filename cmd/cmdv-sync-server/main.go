@@ -180,7 +180,11 @@ func run(cfg *config.Config) {
 func probeHealth(cfg *config.Config) int {
 	// The loopback address rather than cfg.Host: the check runs inside the container alongside the
 	// server, and 0.0.0.0 is a bind address rather than somewhere to connect to.
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", cfg.Port)
+	//
+	// /healthz rather than /api/v1/health, because it sits outside the protocol version check. A
+	// container's liveness must not be able to depend on a version header, and this way it provably
+	// cannot. Both endpoints touch the database, so nothing is given up by choosing the stabler path.
+	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", cfg.Port)
 	client := &http.Client{Timeout: 3 * time.Second}
 
 	resp, err := client.Get(url)

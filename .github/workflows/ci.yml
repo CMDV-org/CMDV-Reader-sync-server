@@ -126,6 +126,14 @@ jobs:
 
           curl -fsS http://127.0.0.1:8080/api/v1/health | tee /dev/stderr | grep -q '"status":"ok"'
 
+          # The operational probe, checked the way a monitor would: exact body on GET, and HEAD not
+          # 404ing. The container's own HEALTHCHECK already runs this path, but it only looks at the
+          # status, and blackbox_exporter matches the body.
+          [ "$(curl -fsS http://127.0.0.1:8080/healthz)" = '{"ok":true}' ]
+          curl -fsS -I http://127.0.0.1:8080/healthz | grep -q '200'
+          # Unversioned on purpose: a monitor must not be breakable by a protocol header.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-CMDV-Sync-Version: 99' http://127.0.0.1:8080/healthz)" = "200" ]
+
           sync_call() {
             curl -fsS -X POST http://127.0.0.1:8080/api/v1/sync \
               -H 'Content-Type: application/json' \

@@ -28,6 +28,7 @@ That is the whole installation. Everything below is detail.
 - [Pointing the app at it](#pointing-the-app-at-it)
 - [Tokens, datasets and devices](#tokens-datasets-and-devices)
 - [Your data: backup and restore](#your-data-backup-and-restore)
+- [Monitoring](#monitoring)
 - [Upgrading](#upgrading)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
@@ -69,11 +70,11 @@ docker compose up -d
 Check it:
 
 ```bash
-curl http://127.0.0.1:8080/api/v1/health
+curl http://127.0.0.1:8080/healthz
 ```
 
 ```json
-{"status":"ok","version":2}
+{"ok":true}
 ```
 
 Watch it:
@@ -200,7 +201,7 @@ TLS is not terminated here. Put this behind a reverse proxy; do not expose it di
 | Flag | What it does |
 |---|---|
 | `-version` | Print the version and exit. |
-| `-health-check` | Probe a running server on the configured port and exit `0` or `1`. This is what the container's health check runs, so it follows `CMDV_SYNC_PORT` without being told. |
+| `-health-check` | Probe `/healthz` on the configured port and exit `0` or `1`. This is what the container's health check runs, so it follows `CMDV_SYNC_PORT` without being told. |
 | `-backup <path>` | Write a consistent copy of the database and exit. Safe while the server is running. See [backup](#your-data-backup-and-restore). |
 
 ## Ports and networking
@@ -403,6 +404,54 @@ The blobs are sealed by the app. Neither the server nor `sqlite3` nor you can re
 that is the point, and it is the one real cost of this design. Sync problems are diagnosed in the app,
 where the data can actually be decrypted.
 
+## Monitoring
+
+Point whatever you use at `/healthz`:
+
+```bash
+curl -s http://127.0.0.1:8080/healthz     # {"ok":true}
+curl -sI http://127.0.0.1:8080/healthz    # HEAD works too
+```
+
+| | |
+|---|---|
+| `200` | `{"ok":true}` |
+| `500` | `{"ok":false}` |
+
+No authentication, no version header, no redirect, and no side effects — it is safe to poll as often
+as you like. It is **not** under `/api/v1/`, and that is deliberate: a monitor has no stake in the sync
+protocol, so it cannot be made to go red by a protocol change or a stale version header.
+
+**It touches the database.** One trivial query, bounded at two seconds. That is the difference between
+"a process is accepting connections" and "this server can actually serve" — a wedged or lock-starved
+database gives you a `500` instead of a green check above a queue of failing syncs, which is the
+failure worth catching on replicated or network storage. Two seconds is far longer than any query this
+server makes, and shorter than its own five-second database busy timeout, so an externally locked
+database reports unhealthy rather than leaving your monitor to time out with nothing to show.
+
+Successful probes are logged at `debug`, not `info`. A check every fifteen seconds is thousands of
+identical lines a day, and a log nobody reads is the same as no log. A *failing* probe is logged
+normally, with the database error attached, because that is the line you will come looking for.
+
+With Prometheus blackbox_exporter:
+
+```yaml
+modules:
+  cmdv_sync:
+    prober: http
+    http:
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '"ok"\s*:\s*true'
+```
+
+The body is a stable literal and is pinned by a fixture, so that regexp will not quietly stop matching
+after an upgrade.
+
+`/api/v1/health` still exists and also touches the database. It is the client-facing one: it reports
+the protocol version, which is what lets the app distinguish "wrong address" from "bad token". Use
+`/healthz` for monitoring and leave that one to the app.
+
 ## Upgrading
 
 With Compose, tracking the published image:
@@ -527,7 +576,8 @@ Three properties carry the whole design:
 | `POST` | `/api/v1/sync` | Push entries and pull what came from elsewhere. An empty `entries` is a pull. |
 | `GET` | `/api/v1/devices` | List the devices in this dataset. |
 | `DELETE` | `/api/v1/devices/{deviceID}` | Delist a device. Its entries are kept. |
-| `GET` | `/api/v1/health` | Unauthenticated. What to point a monitor at. |
+| `GET` | `/api/v1/health` | Unauthenticated. Reports the protocol version, so a client can tell a version mismatch from a bad token. |
+| `GET` | `/healthz` | Unauthenticated, unversioned. `{"ok":true}` or `{"ok":false}`. What to point a monitor at. |
 
 Every request carries `X-CMDV-Sync-Version: 2`; a mismatch is refused with `409`. A request with no
 version header is treated as the current version, so a plain `curl` against health is not refused.
@@ -575,7 +625,7 @@ cmd/cmdv-sync-server/   Read the environment, open the store, listen, shut down 
 internal/config/        Six variables, validated, with refusals that name the variable
 internal/auth/          Constant-time lookup, token → dataset
 internal/store/         Two tables; append and page. Bound parameters only
-internal/api/           Four routes, and the wire types
+internal/api/           Five routes, and the wire types
 spec/                   The normative protocol and its fixtures
 ```
 

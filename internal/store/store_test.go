@@ -449,7 +449,49 @@ func TestSequencesAreNeverReused(t *testing.T) {
 
 func TestPingReportsAHealthyDatabase(t *testing.T) {
 	s := open(t)
+
+	// Empty is healthy. Ping reads the highest sequence, and no rows is an answer rather than a fault —
+	// a fresh install must not report itself unhealthy.
 	if err := s.Ping(context.Background()); err != nil {
-		t.Errorf("ping failed on a healthy database: %v", err)
+		t.Errorf("ping failed on an empty database: %v", err)
+	}
+
+	append1(t, s, datasetA, phone, "something")
+	if err := s.Ping(context.Background()); err != nil {
+		t.Errorf("ping failed on a populated database: %v", err)
+	}
+}
+
+// The failure the probe exists to catch. A closed store stands in for a database that cannot be read —
+// the wedged or lock-starved case on replicated storage — and Ping has to report it rather than
+// succeeding because the process is still alive.
+func TestPingFailsWhenTheDatabaseCannotBeRead(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	if err := s.Ping(context.Background()); err != nil {
+		t.Fatalf("ping failed while open: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("closing: %v", err)
+	}
+	if err := s.Ping(context.Background()); err == nil {
+		t.Error("ping succeeded against a closed database")
+	}
+}
+
+// A cancelled context must abort the touch rather than run it. This is what bounds the health probe:
+// with one connection, a touch can queue behind an in-flight request, and database/sql honours the
+// deadline while waiting for a connection as well as while running the query.
+func TestPingRespectsACancelledContext(t *testing.T) {
+	s := open(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := s.Ping(ctx); err == nil {
+		t.Error("ping ignored a cancelled context")
 	}
 }

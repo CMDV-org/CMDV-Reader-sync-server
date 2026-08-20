@@ -2,10 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Package api is the HTTP surface: four routes, and nothing that understands a payload.
+// Package api is the HTTP surface: five routes, and nothing that understands a payload.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -52,19 +53,33 @@ func New(st *store.Store, tokens *auth.TokenSet, logger *slog.Logger, opts ...Op
 // Returned rather than started, so a test can drive the real routes over a real socket with
 // httptest. There are no mocks anywhere in this server's tests as a result.
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/sync", s.handleSync)
-	mux.HandleFunc("GET /api/v1/devices", s.handleDevices)
-	mux.HandleFunc("DELETE /api/v1/devices/{deviceID}", s.handleRemoveDevice)
-	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	protocol := http.NewServeMux()
+	protocol.HandleFunc("POST /api/v1/sync", s.handleSync)
+	protocol.HandleFunc("GET /api/v1/devices", s.handleDevices)
+	protocol.HandleFunc("DELETE /api/v1/devices/{deviceID}", s.handleRemoveDevice)
+	protocol.HandleFunc("GET /api/v1/health", s.handleHealth)
 
 	// Anything else is an honest 404 with a reason, not a bare status. A path a reverse proxy failed
 	// to strip is a misconfiguration, and the reader needs to be told that rather than shown
 	// something they cannot act on.
-	mux.HandleFunc("/", s.handleNotFound)
+	protocol.HandleFunc("/", s.handleNotFound)
+
+	// Operational routes sit *outside* the version check, and that separation is the point of the
+	// second mux rather than a path exemption inside the middleware.
+	//
+	// /healthz is for whatever watches the process, not for a sync client. Putting it behind
+	// checkVersion would mean a monitor could be made to fail by a protocol change it has no stake
+	// in — send a stale version header and the probe 409s, the alert fires, and nothing is actually
+	// wrong. Structuring it out makes that impossible instead of merely unlikely.
+	//
+	// Registering "GET /healthz" also serves HEAD: net/http treats GET patterns as matching HEAD, and
+	// the server drops the body for a HEAD response itself. So `curl -sI` works with no extra route.
+	operational := http.NewServeMux()
+	operational.HandleFunc("GET /healthz", s.handleHealthz)
+	operational.Handle("/", s.checkVersion(protocol))
 
 	// Outermost first: recovery has to wrap everything, including the version check.
-	return s.recover(s.logRequests(s.checkVersion(mux)))
+	return s.recover(s.logRequests(operational))
 }
 
 // MARK: Middleware
@@ -96,7 +111,16 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		started := s.now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		s.logger.Info("request",
+
+		// A probe answering every fifteen seconds is thousands of identical lines a day, and a log
+		// nobody reads is the same as no log. Successful probes go to debug so that `info` stays
+		// readable; a *failing* probe is logged at its normal level, because that is the line an
+		// operator actually wants to find.
+		level := slog.LevelInfo
+		if isProbePath(r.URL.Path) && rec.status < 400 {
+			level = slog.LevelDebug
+		}
+		s.logger.Log(r.Context(), level, "request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
@@ -295,6 +319,38 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.logger, http.StatusOK, HealthResponse{Status: "ok", Version: ProtocolVersion})
+}
+
+// handleHealthz is the operational probe: is this server able to serve?
+//
+// No authentication, no version header, no redirect, and nothing that changes state. It answers
+// `{"ok":true}` with 200, or `{"ok":false}` with 500, and nothing else — a monitor should be able to
+// match the body with a fixed string.
+//
+// The database touch is what distinguishes this from checking that a port is open. It is a single
+// `SELECT 1`, bounded by HealthzTimeout so the probe can never hang: with one connection to the
+// store, a touch may have to queue behind an in-flight sync, and database/sql honours the deadline
+// while waiting for that connection as well as while running the query. So a server that is merely
+// busy answers in milliseconds, and one whose database is wedged or lock-starved answers 500 rather
+// than leaving the monitor to time out with no reason attached.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), HealthzTimeout)
+	defer cancel()
+
+	if err := s.store.Ping(ctx); err != nil {
+		// Logged, because a probe going red is the one thing an operator will come looking for, and
+		// the reason belongs where they can see it rather than in a response body a monitor discards.
+		s.logger.Error("healthz: the database did not answer", "error", err)
+		writeJSON(w, s.logger, http.StatusInternalServerError, HealthzResponse{OK: false})
+		return
+	}
+	writeJSON(w, s.logger, http.StatusOK, HealthzResponse{OK: true})
+}
+
+// isProbePath reports whether a path is polled continuously by machines rather than requested by a
+// client, and therefore whether a successful request to it is worth an info-level log line.
+func isProbePath(path string) bool {
+	return path == "/healthz" || path == "/api/v1/health"
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
