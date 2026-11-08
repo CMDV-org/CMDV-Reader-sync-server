@@ -79,4 +79,5 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${{ steps.build.outputs.digest }}"
       - name: Helm heartbeat (ci-cmdv-reader-sync-server)
-        run: curl -fsS -X POST -H "Authorization: Bearer ${{ secrets.HELM_HEARTBEAT_TOKEN }}" "${{ vars.HELM_URL }}/api/heartbeat/ci-cmdv-reader-sync-server" >/dev/null && echo heartbeat sent
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer ${{ secrets.HELM_HEARTBEAT_TOKEN }}" "${{ vars.HELM_URL }}/api/heartbeat/ci-cmdv-reader-sync-server" >/dev/null && echo heartbeat sent
