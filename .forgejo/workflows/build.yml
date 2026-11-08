@@ -67,6 +67,8 @@ jobs:
           platforms: linux/amd64
           push: true
           pull: true          # always fetch the newest base image so OS-level CVE fixes land on rebuild
+          provenance: false  # no attestation index: Harbor then scans and reports the TAGGED manifest (Helm keys alerts by repo:tag; the deployed digest is the scanned digest)
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
