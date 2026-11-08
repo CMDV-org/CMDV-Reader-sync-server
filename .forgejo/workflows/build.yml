@@ -1,0 +1,82 @@
+# Forgejo Actions — test, cross-compile check, build + sign + push the image to the lab
+# registry (Harbor, registry.cmdv.site/lab). Replaces the GitHub workflows on 2026-11-08
+# (HomeLab Docs/docs/plan-forge-ci.md P4). Org-level secrets/variables: HARBOR_USER,
+# HARBOR_TOKEN, COSIGN_PRIVATE_KEY, COSIGN_PASSWORD, HELM_HEARTBEAT_TOKEN; REGISTRY,
+# HARBOR_PROJECT, HELM_URL.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.26"
+  IMAGE: ${{ vars.REGISTRY }}/${{ vars.HARBOR_PROJECT }}/cmdv-reader-sync-server
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: https://github.com/actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "not gofmt-clean:"; echo "$unformatted"; gofmt -d .; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: Cross-compile every release target
+        run: |
+          set -euo pipefail
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/cmdv-sync-server
+            echo "ok $target"
+          done
+
+  image:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: https://github.com/docker/setup-buildx-action@v3
+      - uses: https://github.com/docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY }}
+          username: ${{ secrets.HARBOR_USER }}
+          password: ${{ secrets.HARBOR_TOKEN }}
+      - id: meta
+        uses: https://github.com/docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+      - id: build
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+      - uses: https://github.com/sigstore/cosign-installer@v3
+      - name: Sign the image (keyed cosign; public key in HomeLab Stacks/harbor/cosign-ci.pub)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${{ steps.build.outputs.digest }}"
+      - name: Helm heartbeat (ci-cmdv-reader-sync-server)
+        run: curl -fsS -X POST -H "Authorization: Bearer ${{ secrets.HELM_HEARTBEAT_TOKEN }}" "${{ vars.HELM_URL }}/api/heartbeat/ci-cmdv-reader-sync-server" >/dev/null && echo heartbeat sent
