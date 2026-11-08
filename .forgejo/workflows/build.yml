@@ -66,6 +66,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          pull: true          # always fetch the newest base image so OS-level CVE fixes land on rebuild
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
