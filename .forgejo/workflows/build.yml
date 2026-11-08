@@ -75,9 +75,12 @@ jobs:
       - uses: https://github.com/sigstore/cosign-installer@v3
       - name: Sign the image (keyed cosign; public key in HomeLab Stacks/harbor/cosign-ci.pub)
         env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PRIVATE_KEY_B64: ${{ secrets.COSIGN_PRIVATE_KEY_B64 }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${{ steps.build.outputs.digest }}"
+        run: |
+          umask 077; printf '%s' "$COSIGN_PRIVATE_KEY_B64" | base64 -d > /tmp/cosign.key
+          cosign sign --yes --key /tmp/cosign.key "${IMAGE}@${{ steps.build.outputs.digest }}"
+          rm -f /tmp/cosign.key
       - name: Helm heartbeat (ci-cmdv-reader-sync-server)
         run: |
           curl -fsS -X POST -H "Authorization: Bearer ${{ secrets.HELM_HEARTBEAT_TOKEN }}" "${{ vars.HELM_URL }}/api/heartbeat/ci-cmdv-reader-sync-server" >/dev/null && echo heartbeat sent
