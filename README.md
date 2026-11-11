@@ -1,6 +1,6 @@
 # cmdv-sync-server
 
-A sync server for [CMDV Reader](https://github.com/marc2912/CMDV-Reader). It keeps reading positions,
+A sync server for [CMDV Reader](https://github.com/CMDV-org/CMDV-Reader). It keeps reading positions,
 highlights, notes, bookmarks, reading sessions and settings in step between a reader's devices.
 
 **It cannot read what it stores.** The server holds opaque blobs and hands them back in the order they
@@ -57,7 +57,7 @@ server stay this simple: it never has to arbitrate, so it never needs to underst
 Needs Docker with the Compose plugin. Nothing else — no Go toolchain, no database to set up.
 
 ```bash
-git clone https://github.com/marc2912/CMDV-Reader-sync-server.git
+git clone https://github.com/CMDV-org/CMDV-Reader-sync-server.git
 cd CMDV-Reader-sync-server
 
 cp .env.example .env
@@ -129,7 +129,7 @@ Raspberry Pi before the first release, build locally with `docker compose up -d 
 ### As a binary, without Docker
 
 Prebuilt binaries for macOS, Windows and Linux on amd64 and arm64 are attached to each
-[release](https://github.com/marc2912/CMDV-Reader-sync-server/releases). They are single static
+[release](https://github.com/CMDV-org/CMDV-Reader-sync-server/releases). They are single static
 executables with no runtime to install and no dependencies.
 
 ```bash
